@@ -57,6 +57,60 @@ public final class TokenUsageUtils {
     }
 
     /**
+     * Normalize a provider usage payload into the Claude usage schema
+     * (snake_case, input excluding cached tokens).
+     *
+     * <p>Marker CLI bridges emit provider-native usage objects: MiniMax mcode
+     * 0.4.x sends camelCase fields ({@code inputTokens}/{@code outputTokens}/
+     * {@code cacheReadTokens}/{@code cacheWriteTokens}, where input already
+     * excludes cached tokens — its totalTokens formula is input+output+reasoning),
+     * while other providers already send Claude-shaped snake_case. The rebuild
+     * handles both with snake_case taking precedence, and preserves the optional
+     * context-window metadata keys consumed by {@link #extractMaxTokens}.
+     *
+     * @param raw provider usage payload, or null
+     * @return Claude-schema usage object, or null when no token fields are present
+     */
+    public static JsonObject normalizeProviderUsage(JsonObject raw) {
+        if (raw == null) {
+            return null;
+        }
+        int input = readIntField(raw, "input_tokens", "inputTokens");
+        int output = readIntField(raw, "output_tokens", "outputTokens");
+        int cacheRead = readIntField(raw, "cache_read_input_tokens", "cached_input_tokens", "cacheReadTokens");
+        int cacheCreation = readIntField(raw, "cache_creation_input_tokens", "cacheWriteTokens");
+        if (input == 0 && output == 0 && cacheRead == 0 && cacheCreation == 0) {
+            return null;
+        }
+        JsonObject normalized = new JsonObject();
+        normalized.addProperty("input_tokens", input);
+        normalized.addProperty("output_tokens", output);
+        normalized.addProperty("cache_read_input_tokens", cacheRead);
+        normalized.addProperty("cache_creation_input_tokens", cacheCreation);
+        String[] metadataKeys = {"model_context_window", "maxTokens", "limit"};
+        for (String key : metadataKeys) {
+            if (raw.has(key) && !raw.get(key).isJsonNull()) {
+                normalized.add(key, raw.get(key));
+            }
+        }
+        return normalized;
+    }
+
+    private static int readIntField(JsonObject json, String... keys) {
+        for (String key : keys) {
+            if (!json.has(key) || json.get(key).isJsonNull()) {
+                continue;
+            }
+            try {
+                return Math.max(0, json.get(key).getAsInt());
+            } catch (RuntimeException ignored) {
+                // Fall through to the next candidate key on malformed values.
+            }
+        }
+        return 0;
+    }
+
+    /**
      * Resolve the effective context window retained in provider usage metadata.
      * Providers that do not report a session-specific value keep the supplied
      * static model limit as a compatibility fallback.
@@ -80,7 +134,6 @@ public final class TokenUsageUtils {
         }
         return Math.max(0, fallbackMaxTokens);
     }
-
     /**
      * Find the last usage JSON from a list of raw server messages (JsonObject).
      * Scans from end to find the last assistant message with usage data.

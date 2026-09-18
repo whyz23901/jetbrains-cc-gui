@@ -112,6 +112,11 @@ public class CodexMessageHandler implements MessageCallback {
             if (content != null && !content.trim().isEmpty()) {
                 callbackHandler.notifyStatusMessage(content);
             }
+        } else if ("usage".equals(type)) {
+            // Marker CLI bridges (MiniMax mcode, omp, ...) emit [USAGE] with the
+            // turn's token accounting. MiniMax mcode 0.4.x sends camelCase fields;
+            // normalizeProviderUsage maps them onto the Claude usage schema.
+            handleUsageMessage(content);
         } else if ("message_end".equals(type)) {
             handleMessageEnd();
         } else {
@@ -297,6 +302,50 @@ public class CodexMessageHandler implements MessageCallback {
             }
         } catch (Exception e) {
             LOG.debug("Failed to parse Codex result message: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Handle a [USAGE] marker from a marker CLI bridge (MiniMax mcode, omp, ...).
+     *
+     * <p>Unlike Codex result messages, this usage is the authoritative per-turn
+     * accounting for the provider, so it updates the top-level context snapshot
+     * (feeding UsagePushService on recovery) and pushes a live context-ring
+     * update, mirroring {@code GrokMessageHandler}/{@code ZcodeMessageHandler}.
+     *
+     * @param jsonContent raw usage payload, camelCase (mcode) or snake_case
+     * @since 0.5.6
+     */
+    private void handleUsageMessage(String jsonContent) {
+        try {
+            com.google.gson.Gson gson = new com.google.gson.Gson();
+            com.google.gson.JsonObject raw = gson.fromJson(jsonContent, com.google.gson.JsonObject.class);
+            com.google.gson.JsonObject usage = com.github.claudecodegui.util.TokenUsageUtils
+                    .normalizeProviderUsage(raw);
+            if (usage == null) {
+                LOG.debug("CLI [USAGE] payload without recognizable token fields: " + jsonContent);
+                return;
+            }
+
+            boolean attached = attachUsageToLastAssistant(usage, null);
+            int used = com.github.claudecodegui.util.TokenUsageUtils
+                    .extractContextTokens(usage, state.getProvider());
+            if (used <= 0) {
+                LOG.debug("CLI [USAGE] received but no context tokens extracted: " + jsonContent);
+                return;
+            }
+            int fallbackMax = com.github.claudecodegui.handler.provider.ModelProviderHandler
+                    .getModelContextLimit(state.getProvider(), state.getModel());
+            int maxTokens = com.github.claudecodegui.util.TokenUsageUtils
+                    .extractMaxTokens(usage, fallbackMax);
+            LOG.info("CLI [USAGE] context ring: provider=" + state.getProvider()
+                    + " used=" + used + " max=" + maxTokens);
+            callbackHandler.notifyUsageUpdate(used, maxTokens);
+            if (attached) {
+                callbackHandler.notifyMessageUpdate(state.getMessages());
+            }
+        } catch (Exception e) {
+            LOG.debug("Failed to parse CLI usage message: " + e.getMessage());
         }
     }
 

@@ -3,6 +3,7 @@ package com.github.claudecodegui.session;
 import com.github.claudecodegui.provider.common.SDKResult;
 import com.github.claudecodegui.session.ClaudeSession.Message;
 import com.github.claudecodegui.permission.PermissionRequest;
+import com.github.claudecodegui.util.TokenUsageUtils;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import org.junit.Test;
@@ -95,6 +96,49 @@ public class CodexMessageHandlerTest {
         public void onThinkingDelta(String delta) {
             thinkingDeltas.add(delta);
         }
+
+        int usageUpdateCount = 0;
+        int lastUsedTokens = -1;
+        int lastMaxTokens = -1;
+
+        @Override
+        public void onUsageUpdate(int usedTokens, int maxTokens) {
+            usageUpdateCount++;
+            lastUsedTokens = usedTokens;
+            lastMaxTokens = maxTokens;
+        }
+    }
+
+    /**
+     * Verifies a marker CLI bridge [USAGE] payload (MiniMax mcode 0.4.x camelCase) is
+     * normalized onto the Claude schema, attached as the top-level context snapshot on
+     * the last assistant message, and pushed live to the context ring.
+     */
+    @Test
+    public void usageMarkerNormalizesMiniMaxPayloadAndPushesContextRing() {
+        SessionState state = new SessionState();
+        state.setProvider("minimax");
+        state.setModel("MiniMax-M3");
+
+        CallbackHandler callbackHandler = new CallbackHandler();
+        RecordingCallback callback = new RecordingCallback();
+        callbackHandler.setCallback(callback);
+
+        CodexMessageHandler handler = new CodexMessageHandler(state, callbackHandler);
+        handler.onMessage("assistant", "{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}");
+        // Real mcode 0.4.10 turn.completed payload: input excludes cached tokens.
+        handler.onMessage("usage", "{\"inputTokens\":31292,\"outputTokens\":133,\"reasoningTokens\":0,"
+                + "\"cacheReadTokens\":128,\"cacheWriteTokens\":0,\"totalTokens\":31425}");
+
+        Message message = state.getMessages().get(0);
+        assertTrue(message.raw.has("usage"));
+        assertEquals(31292, message.raw.getAsJsonObject("usage").get("input_tokens").getAsInt());
+        assertEquals(31420, TokenUsageUtils.extractContextTokens(
+                message.raw.getAsJsonObject("usage"), "minimax"));
+
+        assertEquals(1, callback.usageUpdateCount);
+        assertEquals(31420, callback.lastUsedTokens);
+        assertTrue(callback.lastMaxTokens > 0);
     }
 
     @Test

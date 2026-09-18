@@ -116,6 +116,51 @@ public class TokenUsageUtilsTest {
         assertTrue(raw.has("turnCostUsd"));
     }
 
+    /**
+     * Verifies MiniMax mcode camelCase usage normalizes onto the Claude schema with the
+     * cache fields split out of the prompt tokens (mcode totalTokens = input+output+reasoning).
+     */
+    @Test
+    public void normalizeProviderUsageMapsMiniMaxCamelCasePayload() {
+        JsonObject raw = new JsonObject();
+        raw.addProperty("inputTokens", 31292);
+        raw.addProperty("outputTokens", 133);
+        raw.addProperty("reasoningTokens", 0);
+        raw.addProperty("cacheReadTokens", 128);
+        raw.addProperty("cacheWriteTokens", 0);
+        raw.addProperty("totalTokens", 31425);
+
+        JsonObject normalized = TokenUsageUtils.normalizeProviderUsage(raw);
+
+        assertEquals(31292, normalized.get("input_tokens").getAsInt());
+        assertEquals(133, normalized.get("output_tokens").getAsInt());
+        assertEquals(128, normalized.get("cache_read_input_tokens").getAsInt());
+        assertEquals(0, normalized.get("cache_creation_input_tokens").getAsInt());
+        assertEquals(31420, TokenUsageUtils.extractContextTokens(normalized, "minimax"));
+    }
+
+    /**
+     * Verifies Claude-shaped snake_case usage passes through normalization unchanged and
+     * payloads without recognizable token fields are rejected.
+     */
+    @Test
+    public void normalizeProviderUsagePassesSnakeCaseThroughAndRejectsUnknown() {
+        JsonObject snake = new JsonObject();
+        snake.addProperty("input_tokens", 100);
+        snake.addProperty("output_tokens", 20);
+        snake.addProperty("cache_read_input_tokens", 7);
+
+        JsonObject normalized = TokenUsageUtils.normalizeProviderUsage(snake);
+        assertEquals(100, normalized.get("input_tokens").getAsInt());
+        assertEquals(7, normalized.get("cache_read_input_tokens").getAsInt());
+        assertEquals(107, TokenUsageUtils.extractContextTokens(normalized, "minimax"));
+
+        JsonObject junk = new JsonObject();
+        junk.addProperty("foo", 1);
+        assertTrue(TokenUsageUtils.normalizeProviderUsage(junk) == null);
+        assertTrue(TokenUsageUtils.normalizeProviderUsage(null) == null);
+    }
+
     private static JsonObject usage(int inputTokens) {
         JsonObject usage = new JsonObject();
         usage.addProperty("input_tokens", inputTokens);
