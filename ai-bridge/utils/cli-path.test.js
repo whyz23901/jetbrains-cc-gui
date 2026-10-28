@@ -6,6 +6,7 @@ import { dirname, join, normalize } from 'node:path';
 import {
   decodeCliOutput,
   isWindowsCmdShim,
+  isDeadCmdShim,
   quoteCmdArg,
   resolveCliSpawn,
   selectWindowsWhereMatch,
@@ -377,4 +378,78 @@ test('buildCliSpawnEnv leads PATH with the resolved binary own dir', () => {
   const bare = buildCliSpawnEnv('pi', home, { PATH: '/usr/bin' });
   assert.notEqual(bare.PATH.split(':')[0], 'pi');
   assert.ok(bare.PATH.split(':').pop() === '/usr/bin');
+});
+
+test('isDeadCmdShim flags a shim whose last quoted target is missing', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cc-gui-dead-shim-'));
+  // Mirrors the real stale-install shape: an earlier `set "VAR=path"` line,
+  // then a delegation to a target that no longer exists.
+  const dead = join(root, 'minimax.cmd');
+  writeFileSync(dead, '@echo off\r\nset "MINIMAX_DATA_DIR=X:\\data"\r\n"X:\\npm-global\\mcode.cmd" %*\r\n');
+  assert.equal(isDeadCmdShim(dead, { forceWindows: true }), true);
+});
+
+test('isDeadCmdShim keeps a shim whose last quoted target exists', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cc-gui-alive-shim-'));
+  // Runtime-joined absolute path: matches the drive-letter regex on win32 and
+  // exists there; on POSIX the regex never matches, so the shim is alive too.
+  const target = join(root, 'mcode.cmd');
+  writeFileSync(target, '@echo off\r\n');
+  const alive = join(root, 'minimax.cmd');
+  writeFileSync(alive, `@echo off\r\n"${target}" %*\r\n`);
+  assert.equal(isDeadCmdShim(alive, { forceWindows: true }), false);
+});
+
+test('isDeadCmdShim cannot-verify cases stay alive', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cc-gui-unverif-shim-'));
+  // Unresolved %VAR% in the target: statically unknowable.
+  const withVar = join(root, 'mgr.cmd');
+  writeFileSync(withVar, '@echo off\r\n"%~dp0releases\\%MCODE_RELEASE%\\.mcode-launcher.cmd" %*\r\n');
+  assert.equal(isDeadCmdShim(withVar, { forceWindows: true }), false);
+  // No quoted absolute target at all.
+  const plain = join(root, 'plain.cmd');
+  writeFileSync(plain, '@echo off\r\nnode server.js\r\n');
+  assert.equal(isDeadCmdShim(plain, { forceWindows: true }), false);
+  // Missing file and non-shim extensions.
+  assert.equal(isDeadCmdShim(join(root, 'missing.cmd'), { forceWindows: true }), false);
+  assert.equal(isDeadCmdShim(join(root, 'minimax.exe'), { forceWindows: true }), false);
+  // %~dp0-relative target that is genuinely missing (win32 semantics).
+  const dp0Dead = join(root, 'dp0-dead.cmd');
+  writeFileSync(dp0Dead, '@echo off\r\n"%~dp0gone\\target.cmd" %*\r\n');
+  assert.equal(isDeadCmdShim(dp0Dead, { forceWindows: true }), process.platform === 'win32' ? true : false);
+});
+
+test('isDeadCmdShim honors %~dp0 targets that exist next to the shim', () => {
+  if (process.platform !== 'win32') return;
+  const root = mkdtempSync(join(tmpdir(), 'cc-gui-dp0-alive-'));
+  mkdirSync(join(root, 'releases'), { recursive: true });
+  writeFileSync(join(root, 'releases', 'mcode.cmd'), '@echo off\r\n');
+  const shim = join(root, 'minimax.cmd');
+  writeFileSync(shim, '@echo off\r\n"%~dp0releases\\mcode.cmd" %*\r\n');
+  assert.equal(isDeadCmdShim(shim), false);
+});
+
+test('resolveCliPath skips a dead home shim and falls through to the next candidate', () => {
+  // Windows-only: only there can a .cmd candidate be recognized as a dead shim.
+  if (process.platform !== 'win32') return;
+  const root = mkdtempSync(join(tmpdir(), 'cc-gui-skip-dead-'));
+  const staleDir = join(root, 'stale');
+  const freshDir = join(root, 'fresh');
+  mkdirSync(staleDir, { recursive: true });
+  mkdirSync(freshDir, { recursive: true });
+  const name = 'ccgui-deadtest-cli-3fb1';
+  // Stale shim delegates to a removed install.
+  writeFileSync(join(staleDir, `${name}.cmd`), '@echo off\r\n"X:\\removed-install\\cli.cmd" %*\r\n');
+  // Fresh shim delegates to an existing sibling.
+  writeFileSync(join(freshDir, 'real-target.cmd'), '@echo off\r\n');
+  writeFileSync(join(freshDir, `${name}.cmd`), `@echo off\r\n"${join(freshDir, 'real-target.cmd')}" %*\r\n`);
+
+  // A never-on-PATH binary name keeps the which/login-shell lookups from
+  // short-circuiting, so discovery walks the home candidates in order.
+  const resolved = resolveCliPath({
+    binaryName: name,
+    envKeys: [],
+    homeCandidates: [`${root}/stale/{bin}`, `${root}/fresh/{bin}`],
+  });
+  assert.equal(normalize(resolved), normalize(join(freshDir, `${name}.cmd`)));
 });

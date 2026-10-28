@@ -3,9 +3,10 @@
  */
 
 import { spawn } from 'child_process';
+import { existsSync } from 'fs';
 import { createInterface } from 'readline';
 import { emitSendError, endStream } from './marker-protocol.js';
-import { resolveCliSpawn } from './cli-path.js';
+import { resolveCliSpawn, decodeCliOutput, stripOuterQuotes } from './cli-path.js';
 
 function killChildTree(child, label) {
   if (!child || child.killed) return;
@@ -151,15 +152,20 @@ export function runCliStreaming({
     });
 
     child.stderr.on('data', (chunk) => {
-      const text = chunk.toString();
+      // cmd.exe emits localized messages in the OEM codepage (GBK on Chinese
+      // Windows); decode so the surfaced error is readable, not U+FFFD soup.
+      const text = decodeCliOutput(chunk);
       stderrTail = (stderrTail + text).slice(-4000);
       process.stderr.write(text);
     });
 
     child.on('error', (error) => {
       hadError = true;
+      const binPath = stripOuterQuotes(bin);
       const hint = error?.code === 'ENOENT'
-        ? `${label} CLI not found. Install it and ensure \`${bin}\` is on PATH.`
+        ? (existsSync(binPath)
+          ? `${label} CLI failed to start (ENOENT) even though \`${binPath}\` exists — a missing working directory (${cwd}) or a broken shim target inside \`${binPath}\` is the likely cause.`
+          : `${label} CLI not found. Install it and ensure \`${bin}\` is on PATH.`)
         : (error?.message || String(error));
       reportError(hint);
     });
