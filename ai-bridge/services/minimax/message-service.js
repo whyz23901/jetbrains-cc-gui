@@ -664,7 +664,32 @@ export function isMiniMaxTerminalLine(line) {
   return value.type === 'exec.completed' || value.type === 'exec.result';
 }
 
-export function buildMiniMaxArgs({ message, sessionId, model, permissionMode, cwd, imagePaths }) {
+/**
+ * Prompts longer than this ride stdin even without newlines: the Windows
+ * command line caps near 32k chars including the whole argv and quoteCmdArg's
+ * doubling, so stay an order of magnitude below it.
+ */
+const STDIN_PROMPT_ARG_THRESHOLD = 12000;
+
+/**
+ * Decide whether the prompt must be piped via stdin (`mcode exec --input -`)
+ * instead of riding argv.
+ *
+ * Windows cmd.exe command lines cannot carry a newline (everything after the
+ * first line never reaches the CLI — pasted logs arrived as one line) and are
+ * capped near 32k chars including quoting, so oversized prompts fail the spawn
+ * outright. Short single-line prompts keep the plain argv positional.
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function shouldUseStdinPrompt(text) {
+  if (typeof text !== 'string') return false;
+  if (/[\r\n]/.test(text)) return true;
+  return text.length > STDIN_PROMPT_ARG_THRESHOLD;
+}
+
+export function buildMiniMaxArgs({ message, sessionId, model, permissionMode, cwd, imagePaths, promptViaStdin }) {
   const args = [
     'exec',
     '--output-format', 'stream-json',
@@ -689,7 +714,13 @@ export function buildMiniMaxArgs({ message, sessionId, model, permissionMode, cw
       args.push('--file', imagePath);
     }
   }
-  args.push(safePromptArg(message));
+  if (promptViaStdin) {
+    // The prompt travels on stdin (see shouldUseStdinPrompt); --input and the
+    // prompt positional are mutually exclusive in mcode.
+    args.push('--input', '-', '--input-format', 'text');
+  } else {
+    args.push(safePromptArg(message));
+  }
   return args;
 }
 
@@ -982,6 +1013,9 @@ export async function sendMessage(
   }
 
   const bin = resolveMiniMaxCliPath();
+  // Multi-line/oversized prompts ride stdin — cmd.exe argv cannot carry
+  // newlines and caps near 32k chars (see shouldUseStdinPrompt).
+  const promptViaStdin = shouldUseStdinPrompt(promptText);
   const args = buildMiniMaxArgs({
     message: promptText,
     sessionId,
@@ -989,6 +1023,7 @@ export async function sendMessage(
     permissionMode,
     cwd,
     imagePaths,
+    promptViaStdin,
   });
   // Same CR/LF refusal as the parser: a session id from the caller reaches the
   // marker before the CLI even starts.
@@ -997,8 +1032,10 @@ export async function sendMessage(
     emitSessionId(resolvedSessionId);
   }
 
-  logDebug('spawn', bin, args.filter((arg) => arg !== promptText).join(' '),
-    `promptLen=${String(promptText || '').length}`, `permission=${resolvePermissionPolicy(permissionMode)}`);
+  logDebug('spawn', bin, args.join(' ').slice(0, 500),
+    `promptLen=${String(promptText || '').length}`,
+    `promptViaStdin=${promptViaStdin}`,
+    `permission=${resolvePermissionPolicy(permissionMode)}`);
 
   const env = { ...process.env };
   const home = process.env.HOME || process.env.USERPROFILE || homedir();
@@ -1015,6 +1052,7 @@ export async function sendMessage(
       cwd: workCwd,
       env,
       label: 'MiniMax',
+      stdinData: promptViaStdin ? String(promptText ?? '') : undefined,
       // De-duplication lives in handleEvent, which sees the `*_final` replay
       // and the streamed deltas in the same place.
       onLine: (line) => stream.handleEvent(parseMiniMaxStreamLine(line)),

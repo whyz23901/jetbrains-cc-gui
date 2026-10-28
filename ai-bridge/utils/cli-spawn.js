@@ -56,6 +56,10 @@ function killChildTree(child, label) {
  * @param {(message: string) => void} [options.onError] - when set, called instead of
  *   writing `[SEND_ERROR]` (used by session-less ask paths: prompt enhance / commit)
  * @param {boolean} [options.emitEndStream=true] - when false, skip chat stream end markers
+ * @param {string} [options.stdinData] - when set, piped to the child's stdin
+ *   (and stdio[0] becomes 'pipe'). For payloads that cannot ride argv: Windows
+ *   cmd.exe command lines truncate at the first newline and cap near 32k chars,
+ *   so multi-line/oversized prompts must go through a stdin pipe instead.
  * @returns {Promise<{ code: number|null, signal: NodeJS.Signals|null, hadError: boolean, errorMessage?: string }>}
  */
 export function runCliStreaming({
@@ -69,6 +73,7 @@ export function runCliStreaming({
   onCloseBeforeEnd,
   onError,
   emitEndStream = true,
+  stdinData,
 }) {
   return new Promise((resolve) => {
     let hadError = false;
@@ -111,7 +116,7 @@ export function runCliStreaming({
       const invocation = resolveCliSpawn(bin, args, {
         cwd,
         env,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [stdinData != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
       });
       child = spawn(invocation.file, invocation.args, invocation.options);
@@ -120,6 +125,15 @@ export function runCliStreaming({
       reportError(`Failed to spawn ${label} CLI (${bin}): ${error?.message || error}`);
       finish({ code: null, signal: null, hadError });
       return;
+    }
+
+    // Feed piped payloads after the listeners are wired. EPIPE is expected
+    // when the CLI exits before draining stdin (e.g. an immediate arg error),
+    // so write failures must not take the stream loop down.
+    if (stdinData != null && child.stdin) {
+      child.stdin.on('error', () => { /* child exited early; close handler reports */ });
+      child.stdin.write(stdinData);
+      child.stdin.end();
     }
 
     const onParentSignal = () => killChildTree(child, label);

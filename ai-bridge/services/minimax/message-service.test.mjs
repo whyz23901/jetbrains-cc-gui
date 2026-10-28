@@ -13,6 +13,7 @@ import {
   parseMiniMaxStreamLine,
   resetMiniMaxUnknownTypeCounts,
   resolveUnterminatedFailureReason,
+  shouldUseStdinPrompt,
 } from './message-service.js';
 
 // ---------------------------------------------------------------------------
@@ -1393,4 +1394,46 @@ test('buildMiniMaxArgs without images has no --file and ignores falsy entries', 
     imagePaths: ['', null, undefined, 'C:/tmp/ok.png'],
   });
   assert.deepEqual(withFalsy.slice(withFalsy.indexOf('--file'), -1), ['--file', 'C:/tmp/ok.png']);
+});
+
+// ---------------------------------------------------------------------------
+// Multi-line/oversized prompts ride stdin (--input -), not argv
+// ---------------------------------------------------------------------------
+
+test('shouldUseStdinPrompt flags newlines and oversized single lines', () => {
+  assert.equal(shouldUseStdinPrompt('one line'), false);
+  assert.equal(shouldUseStdinPrompt('line1\nline2'), true);
+  assert.equal(shouldUseStdinPrompt('line1\rline2'), true);
+  assert.equal(shouldUseStdinPrompt('with trailing newline\n'), true);
+  assert.equal(shouldUseStdinPrompt('a'.repeat(12001)), true);
+  assert.equal(shouldUseStdinPrompt('a'.repeat(12000)), false);
+  assert.equal(shouldUseStdinPrompt(''), false);
+  assert.equal(shouldUseStdinPrompt(null), false);
+  assert.equal(shouldUseStdinPrompt(undefined), false);
+});
+
+test('buildMiniMaxArgs stdin mode uses --input - and drops the prompt positional', () => {
+  const args = buildMiniMaxArgs({
+    message: 'multi\nline log',
+    sessionId: 'mvs_abc',
+    model: '',
+    permissionMode: 'bypassPermissions',
+    cwd: 'F:/proj',
+    imagePaths: ['C:/tmp/a.png'],
+    promptViaStdin: true,
+  });
+  const inputIdx = args.indexOf('--input');
+  assert.equal(args[inputIdx + 1], '-');
+  assert.equal(args[args.indexOf('--input-format') + 1], 'text');
+  // The prompt positional is gone — argv never carries the payload.
+  assert.equal(args.includes('multi\nline log'), false);
+  assert.equal(args.includes('multi'), false);
+  // --file attachments still ride argv.
+  assert.equal(args[args.indexOf('--file') + 1], 'C:/tmp/a.png');
+  // Non-stdin mode keeps the prompt as the last token.
+  const argvMode = buildMiniMaxArgs({
+    message: 'short one', sessionId: '', model: '', permissionMode: '', cwd: '', promptViaStdin: false,
+  });
+  assert.equal(argvMode[argvMode.length - 1], 'short one');
+  assert.equal(argvMode.includes('--input'), false);
 });
