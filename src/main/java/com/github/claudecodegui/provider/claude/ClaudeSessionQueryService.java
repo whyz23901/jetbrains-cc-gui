@@ -2,8 +2,10 @@ package com.github.claudecodegui.provider.claude;
 
 import com.github.claudecodegui.bridge.EnvironmentConfigurator;
 import com.github.claudecodegui.bridge.NodeDetector;
+import com.github.claudecodegui.bridge.NodeProcessRunner;
 import com.github.claudecodegui.bridge.ProcessManager;
-import com.github.claudecodegui.util.PlatformUtils;
+import com.github.claudecodegui.provider.common.SessionHistoryIncompleteException;
+import com.github.claudecodegui.provider.common.SessionHistoryNotFoundException;
 import com.github.claudecodegui.util.UserMessageSanitizer;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
@@ -11,16 +13,12 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.intellij.openapi.diagnostic.Logger;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.function.Supplier;
@@ -44,6 +42,7 @@ class ClaudeSessionQueryService {
     private final ProcessManager processManager;
     private final EnvironmentConfigurator envConfigurator;
     private final ClaudeJsonOutputExtractor outputExtractor;
+    private final int processTimeoutSeconds;
 
     ClaudeSessionQueryService(
             Logger log,
@@ -54,6 +53,20 @@ class ClaudeSessionQueryService {
             EnvironmentConfigurator envConfigurator,
             ClaudeJsonOutputExtractor outputExtractor
     ) {
+        this(log, gson, nodeDetector, sdkDirSupplier, processManager, envConfigurator, outputExtractor,
+                PROCESS_TIMEOUT_SECONDS);
+    }
+
+    ClaudeSessionQueryService(
+            Logger log,
+            Gson gson,
+            NodeDetector nodeDetector,
+            Supplier<File> sdkDirSupplier,
+            ProcessManager processManager,
+            EnvironmentConfigurator envConfigurator,
+            ClaudeJsonOutputExtractor outputExtractor,
+            int processTimeoutSeconds
+    ) {
         this.log = log;
         this.gson = gson;
         this.nodeDetector = nodeDetector;
@@ -61,11 +74,16 @@ class ClaudeSessionQueryService {
         this.processManager = processManager;
         this.envConfigurator = envConfigurator;
         this.outputExtractor = outputExtractor;
+        this.processTimeoutSeconds = processTimeoutSeconds;
     }
 
     List<JsonObject> getSessionMessages(String sessionId, String cwd) {
         try {
             JsonObject jsonResult = runSessionQuery("getSession", sessionId, cwd, "getSessionMessages");
+
+            if (jsonResult.has("missing") && jsonResult.get("missing").getAsBoolean()) {
+                throw new SessionHistoryNotFoundException(sessionId, cwd);
+            }
 
             if (jsonResult.has("success") && jsonResult.get("success").getAsBoolean()) {
                 List<JsonObject> messages = new ArrayList<>();
@@ -78,6 +96,18 @@ class ClaudeSessionQueryService {
                 return messages;
             }
 
+            // The bridge retries a torn JSONL tail in-process before answering
+            // (HISTORY_READ_RETRIES in session-service.js), so an `incomplete`
+            // response means the writer is still appending to a transcript that the
+            // live state already reflects. It is reported as its own exception so
+            // the caller keeps the live transcript instead of surfacing a failure.
+            if (jsonResult.has("incomplete") && jsonResult.get("incomplete").getAsBoolean()) {
+                throw new SessionHistoryIncompleteException(
+                        jsonResult.has("error") && !jsonResult.get("error").isJsonNull()
+                                ? jsonResult.get("error").getAsString()
+                                : "Session history is still being written");
+            }
+
             String errorMsg = (jsonResult.has("error") && !jsonResult.get("error").isJsonNull())
                     ? jsonResult.get("error").getAsString()
                     : "Unknown error";
@@ -86,6 +116,50 @@ class ClaudeSessionQueryService {
             throw e;
         } catch (Exception e) {
             throw new RuntimeException("Failed to get session messages: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Load a page of session history messages (turn-based pagination).
+     *
+     * @param sessionId the session to load
+     * @param cwd the working directory
+     * @param beforeTurn null for the latest page, or the turn index to load before
+     * @param limit max turns per page
+     * @return the page payload, or null on failure (caller should fall back to getSessionMessages)
+     * @throws SessionHistoryNotFoundException when the transcript is missing
+     */
+    JsonObject getSessionMessagesPage(String sessionId, String cwd, Integer beforeTurn, int limit) {
+        try {
+            JsonObject jsonResult = runSessionQuery("getSessionPage", sessionId, cwd, "getSessionMessagesPage",
+                    beforeTurn == null ? "" : String.valueOf(beforeTurn), String.valueOf(limit));
+
+            // Missing history must clear the stale ID without another bridge read.
+            if (jsonResult.has("missing") && jsonResult.get("missing").getAsBoolean()) {
+                throw new SessionHistoryNotFoundException(sessionId, cwd);
+            }
+
+            if (jsonResult.has("success") && jsonResult.get("success").getAsBoolean()) {
+                // Normalize messages in-place
+                if (jsonResult.has("messages")) {
+                    JsonArray messagesArray = jsonResult.getAsJsonArray("messages");
+                    for (int i = 0; i < messagesArray.size(); i++) {
+                        messagesArray.set(i, normalizeClaudeHistoryMessage(messagesArray.get(i).getAsJsonObject()));
+                    }
+                }
+                return jsonResult;
+            }
+
+            String errorMsg = (jsonResult.has("error") && !jsonResult.get("error").isJsonNull())
+                    ? jsonResult.get("error").getAsString()
+                    : "Unknown error";
+            log.warn("[getSessionMessagesPage] Page query failed: " + errorMsg);
+            return null;
+        } catch (SessionHistoryNotFoundException e) {
+            throw e;
+        } catch (Exception e) {
+            log.warn("[getSessionMessagesPage] Page query error: " + e.getMessage(), e);
+            return null;
         }
     }
 
@@ -112,6 +186,10 @@ class ClaudeSessionQueryService {
     }
 
     private JsonObject runSessionQuery(String commandName, String sessionId, String cwd, String logPrefix) throws Exception {
+        return runSessionQuery(commandName, sessionId, cwd, logPrefix, new String[0]);
+    }
+
+    private JsonObject runSessionQuery(String commandName, String sessionId, String cwd, String logPrefix, String... extraArgs) throws Exception {
         if (sessionId == null || !VALID_SESSION_ID.matcher(sessionId).matches()) {
             throw new IllegalArgumentException("Invalid sessionId: " + sessionId);
         }
@@ -135,6 +213,9 @@ class ClaudeSessionQueryService {
             cwdArg = NodeDetector.isWslPath(node) ? NodeDetector.convertToWslPath(cwd) : cwd;
         }
         command.add(cwdArg);
+        for (String extraArg : extraArgs) {
+            command.add(extraArg);
+        }
 
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.directory(workDir);
@@ -142,36 +223,11 @@ class ClaudeSessionQueryService {
         envConfigurator.updateProcessEnvironment(pb, node);
 
         // L5 fix: register with ProcessManager so cleanupAllProcesses sees this child.
-        String channelId = ProcessManager.newChannelId("claude-session-query");
-        Process process = null;
-        StringBuilder output = new StringBuilder();
-        try {
-            process = pb.start();
-            processManager.registerProcess(channelId, process);
+        // NodeProcessRunner fails rather than returning stdout it has not read to EOF.
+        NodeProcessRunner.Result result = NodeProcessRunner.run(
+                pb, processManager, "claude-session-query", null, processTimeoutSeconds);
 
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                }
-            }
-
-            boolean finished = process.waitFor(PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            if (!finished) {
-                PlatformUtils.terminateProcess(process);
-                throw new RuntimeException("Node.js process timed out after " + PROCESS_TIMEOUT_SECONDS + " seconds");
-            }
-        } finally {
-            if (process != null) {
-                if (process.isAlive()) {
-                    PlatformUtils.terminateProcess(process);
-                }
-                processManager.unregisterProcess(channelId, process);
-            }
-        }
-
-        String outputStr = output.toString().trim();
+        String outputStr = result.output().trim();
         log.debug("[" + logPrefix + "] Raw output length: " + outputStr.length());
         if (log.isDebugEnabled()) {
             log.debug("[" + logPrefix + "] Raw output (first 300 chars): "

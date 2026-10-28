@@ -8,6 +8,7 @@ import {
   KIMI_DEFAULT_MODEL_ID,
   OMP_DEFAULT_MODEL_ID,
   MINIMAX_DEFAULT_MODEL_ID,
+  ZCODE_DEFAULT_MODEL_ID,
   OPENCODE_DEFAULT_MODEL_ID,
   PI_DEFAULT_MODEL_ID,
   DSH_DEFAULT_MODEL_ID,
@@ -20,6 +21,13 @@ import {
 } from '../../components/ChatInputBox/types';
 import type { CodexFastMode, PermissionMode, ReasoningEffort } from '../../components/ChatInputBox/types';
 import { isCliOnlyProvider, normalizeCliPermissionMode, OMP_ROLE_MODEL_IDS } from './cliProviders';
+import {
+  migrateCodexSettingsSnapshot,
+  type CodexApprovalPreset,
+  type CodexCollaborationMode,
+  type CodexSandboxSelection,
+  type CodexSandboxSource,
+} from '../modelProviderStateHelpers';
 
 const STORAGE_KEY = 'model-selection-state';
 const REASONING_VALUES = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -65,6 +73,7 @@ export interface UseModelStatePersistenceOptions {
   setSelectedGrokModel: (value: string) => void;
   setSelectedKimiModel: (value: string) => void;
   setSelectedMiniMaxModel: (value: string) => void;
+  setSelectedZcodeModel: (value: string) => void;
   setSelectedOpenCodeModel: (value: string) => void;
   setSelectedPiModel: (value: string) => void;
   setSelectedOmpModel: (value: string) => void;
@@ -72,6 +81,7 @@ export interface UseModelStatePersistenceOptions {
   setGrokPermissionMode: (value: PermissionMode) => void;
   setKimiPermissionMode: (value: PermissionMode) => void;
   setMiniMaxPermissionMode: (value: PermissionMode) => void;
+  setZcodePermissionMode: (value: PermissionMode) => void;
   setOpenCodePermissionMode: (value: PermissionMode) => void;
   setPiPermissionMode: (value: PermissionMode) => void;
   setOmpPermissionMode: (value: PermissionMode) => void;
@@ -81,6 +91,10 @@ export interface UseModelStatePersistenceOptions {
   setReasoningEffort: (value: ReasoningEffort) => void;
   setCodexFastMode: (value: CodexFastMode) => void;
   setDshPreset: (value: string) => void;
+  setCodexCollaborationMode?: (value: CodexCollaborationMode) => void;
+  setCodexApprovalPreset?: (value: CodexApprovalPreset) => void;
+  setCodexSandboxSelection?: (value: CodexSandboxSelection) => void;
+  setCodexSandboxSource?: (value: CodexSandboxSource) => void;
   // Cross-slice save deps (re-saves on any change)
   currentProvider: string;
   selectedClaudeModel: string;
@@ -90,6 +104,7 @@ export interface UseModelStatePersistenceOptions {
   selectedGrokModel: string;
   selectedKimiModel: string;
   selectedMiniMaxModel: string;
+  selectedZcodeModel: string;
   selectedOpenCodeModel: string;
   selectedPiModel: string;
   selectedOmpModel: string;
@@ -97,6 +112,7 @@ export interface UseModelStatePersistenceOptions {
   grokPermissionMode: PermissionMode;
   kimiPermissionMode: PermissionMode;
   miniMaxPermissionMode: PermissionMode;
+  zcodePermissionMode: PermissionMode;
   openCodePermissionMode: PermissionMode;
   piPermissionMode: PermissionMode;
   ompPermissionMode: PermissionMode;
@@ -105,6 +121,10 @@ export interface UseModelStatePersistenceOptions {
   reasoningEffort: ReasoningEffort;
   codexFastMode: CodexFastMode;
   dshPreset: string;
+  codexCollaborationMode?: CodexCollaborationMode;
+  codexApprovalPreset?: CodexApprovalPreset;
+  codexSandboxSelection?: CodexSandboxSelection;
+  codexSandboxSource?: CodexSandboxSource;
 }
 
 /**
@@ -127,6 +147,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
     setSelectedGrokModel,
     setSelectedKimiModel,
     setSelectedMiniMaxModel,
+    setSelectedZcodeModel,
     setSelectedOpenCodeModel,
     setSelectedPiModel,
     setSelectedOmpModel,
@@ -134,6 +155,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
     setGrokPermissionMode,
     setKimiPermissionMode,
     setMiniMaxPermissionMode,
+    setZcodePermissionMode,
     setOpenCodePermissionMode,
     setPiPermissionMode,
     setOmpPermissionMode,
@@ -143,6 +165,10 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
     setReasoningEffort,
     setCodexFastMode,
     setDshPreset,
+    setCodexCollaborationMode,
+    setCodexApprovalPreset,
+    setCodexSandboxSelection,
+    setCodexSandboxSource,
     currentProvider,
     selectedClaudeModel,
     selectedCodexModel,
@@ -151,6 +177,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
     selectedGrokModel,
     selectedKimiModel,
     selectedMiniMaxModel,
+    selectedZcodeModel,
     selectedOpenCodeModel,
     selectedPiModel,
     selectedOmpModel,
@@ -158,6 +185,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
     grokPermissionMode,
     kimiPermissionMode,
     miniMaxPermissionMode,
+    zcodePermissionMode,
     openCodePermissionMode,
     piPermissionMode,
     ompPermissionMode,
@@ -166,12 +194,20 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
     reasoningEffort,
     codexFastMode,
     dshPreset,
+    codexCollaborationMode = 'default',
+    codexApprovalPreset = 'request',
+    codexSandboxSelection = 'workspace-write',
+    codexSandboxSource = 'default',
   } = options;
 
   // Hydrate from localStorage and sync to backend (mount only).
   // Setters are stable; deps left empty to ensure single execution.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
+    // Tracked so the boot sync retry loop cannot outlive the component: it used
+    // to fire after teardown and touch `window` on a disposed page.
+    let syncTimer: number | undefined;
+    let syncCancelled = false;
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       // Per-tab restore (issue #1353): when the Java backend has loaded a saved
@@ -199,6 +235,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
       let restoredGrokModel = GROK_DEFAULT_MODEL_ID;
       let restoredKimiModel = KIMI_DEFAULT_MODEL_ID;
       let restoredMiniMaxModel = MINIMAX_DEFAULT_MODEL_ID;
+      let restoredZcodeModel = ZCODE_DEFAULT_MODEL_ID;
       let restoredOpenCodeModel = OPENCODE_DEFAULT_MODEL_ID;
       let restoredPiModel = PI_DEFAULT_MODEL_ID;
       let restoredOmpModel = OMP_DEFAULT_MODEL_ID;
@@ -206,6 +243,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
       let restoredGrokPermissionMode: PermissionMode = 'default';
       let restoredKimiPermissionMode: PermissionMode = 'default';
       let restoredMiniMaxPermissionMode: PermissionMode = 'default';
+      let restoredZcodePermissionMode: PermissionMode = 'default';
       let restoredOpenCodePermissionMode: PermissionMode = 'default';
       let restoredPiPermissionMode: PermissionMode = 'default';
       let restoredOmpPermissionMode: PermissionMode = 'default';
@@ -213,14 +251,18 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
       let restoredLongContextEnabled = true;
       let restoredCodexFastMode: CodexFastMode = 'normal';
       let restoredDshPreset = DSH_PRESET_NONE;
+      let restoredCodexSettings = migrateCodexSettingsSnapshot({});
 
       // Model validation helpers — close over the restored* lets so both
       // branches (saved localStorage / fresh backend-only) share the same logic
       // and each getCustomModels localStorage read happens at most once.
       const applyClaudeModel = (modelId: string) => {
-        const normalized = normalizeClaudeModelId(strip1MContextSuffix(modelId));
         const customs = getCustomModels('claude-custom-models');
-        if (CLAUDE_MODELS.find(m => m.id === normalized) || customs.find(m => m.id === normalized)) {
+        // A saved custom id is restored verbatim even if it is in the retired
+        // table; only built-in retired ids are migrated to their replacement.
+        const customIds = new Set(customs.map(m => m.id));
+        const normalized = normalizeClaudeModelId(strip1MContextSuffix(modelId), customIds);
+        if (normalized.startsWith('ccs-claude-') || CLAUDE_MODELS.find(m => m.id === normalized) || customs.find(m => m.id === normalized)) {
           restoredClaudeModel = normalized;
           setSelectedClaudeModel(normalized);
         }
@@ -258,6 +300,10 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
         restoredMiniMaxModel = id;
         setSelectedMiniMaxModel(id);
       });
+      const applyZcodeModel = makeCliModelApplier((id) => {
+        restoredZcodeModel = id;
+        setSelectedZcodeModel(id);
+      });
       const applyOpenCodeModel = makeCliModelApplier((id) => {
         restoredOpenCodeModel = id;
         setSelectedOpenCodeModel(id);
@@ -277,6 +323,11 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
 
       if (saved) {
         const state = JSON.parse(saved);
+        restoredCodexSettings = migrateCodexSettingsSnapshot(state);
+        setCodexCollaborationMode?.(restoredCodexSettings.collaborationMode);
+        setCodexApprovalPreset?.(restoredCodexSettings.approvalPreset);
+        setCodexSandboxSelection?.(restoredCodexSettings.sandboxSelection);
+        setCodexSandboxSource?.(restoredCodexSettings.sandboxSource);
 
         // Backend-supplied provider wins. We still fall through the rest of the
         // hydration so non-provider preferences (permission mode, reasoning
@@ -293,9 +344,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
         }
         const restoredCodexMode = normalizeRestoredPermissionMode(state.codexPermissionMode);
         if (restoredCodexMode) {
-          restoredCodexPermissionMode = restoredCodexMode === 'plan'
-            ? 'default'
-            : restoredCodexMode;
+          restoredCodexPermissionMode = restoredCodexMode;
         }
         const restoredGrokMode = normalizeRestoredPermissionMode(state.grokPermissionMode);
         if (restoredGrokMode) {
@@ -308,6 +357,10 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
         const restoredMiniMaxMode = normalizeRestoredPermissionMode(state.miniMaxPermissionMode);
         if (restoredMiniMaxMode) {
           restoredMiniMaxPermissionMode = normalizeCliPermissionMode(restoredMiniMaxMode, 'minimax');
+        }
+        const restoredZcodeMode = normalizeRestoredPermissionMode(state.zcodePermissionMode);
+        if (restoredZcodeMode) {
+          restoredZcodePermissionMode = normalizeCliPermissionMode(restoredZcodeMode, 'zcode');
         }
         const restoredOpenCodeMode = normalizeRestoredPermissionMode(state.openCodePermissionMode);
         if (restoredOpenCodeMode) {
@@ -370,6 +423,11 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
           : state.miniMaxModel;
         applyMiniMaxModel(miniMaxModelCandidate);
 
+        const zcodeModelCandidate = hasBackendModel && restoredProvider === 'zcode'
+          ? initialTabModel
+          : state.zcodeModel;
+        applyZcodeModel(zcodeModelCandidate);
+
         const openCodeModelCandidate = hasBackendModel && restoredProvider === 'opencode'
           ? initialTabModel
           : state.openCodeModel;
@@ -399,11 +457,16 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
           else if (initialTabProvider === 'grok') applyGrokModel(initialTabModel);
           else if (initialTabProvider === 'kimi') applyKimiModel(initialTabModel);
           else if (initialTabProvider === 'minimax') applyMiniMaxModel(initialTabModel);
+          else if (initialTabProvider === 'zcode') applyZcodeModel(initialTabModel);
           else if (initialTabProvider === 'opencode') applyOpenCodeModel(initialTabModel);
           else if (initialTabProvider === 'pi') applyPiModel(initialTabModel);
           else if (initialTabProvider === 'omp') applyOmpModel(initialTabModel);
           else if (initialTabProvider === 'dsh') applyDshModel(initialTabModel);
         }
+        setCodexCollaborationMode?.(restoredCodexSettings.collaborationMode);
+        setCodexApprovalPreset?.(restoredCodexSettings.approvalPreset);
+        setCodexSandboxSelection?.(restoredCodexSettings.sandboxSelection);
+        setCodexSandboxSource?.(restoredCodexSettings.sandboxSource);
       }
 
       // Reconcile omp mode⇔model pairs saved by builds before the two were
@@ -427,6 +490,8 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
             ? restoredKimiPermissionMode
             : restoredProvider === 'minimax'
               ? restoredMiniMaxPermissionMode
+              : restoredProvider === 'zcode'
+                ? restoredZcodePermissionMode
               : restoredProvider === 'opencode'
               ? restoredOpenCodePermissionMode
               : restoredProvider === 'pi'
@@ -441,6 +506,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
       setGrokPermissionMode(restoredGrokPermissionMode);
       setKimiPermissionMode(restoredKimiPermissionMode);
       setMiniMaxPermissionMode(restoredMiniMaxPermissionMode);
+      setZcodePermissionMode(restoredZcodePermissionMode);
       setOpenCodePermissionMode(restoredOpenCodePermissionMode);
       setPiPermissionMode(restoredPiPermissionMode);
       setOmpPermissionMode(restoredOmpPermissionMode);
@@ -451,6 +517,12 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
       const MAX_SYNC_RETRIES = 30;
 
       const syncToBackend = () => {
+        // The retry loop used to outlive the component: a pending timer fired
+        // after teardown/unmount and touched `window` on a disposed page
+        // (vitest reports it as an unhandled "window is not defined" error).
+        if (syncCancelled) {
+          return;
+        }
         if (window.sendToJava) {
           // Native watchdog reload reuses the original HTML snapshot. Java
           // pushes the current Session state after frontend_ready; echoing the
@@ -467,6 +539,8 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
                 ? restoredKimiModel
                 : restoredProvider === 'minimax'
                   ? restoredMiniMaxModel
+                  : restoredProvider === 'zcode'
+                    ? restoredZcodeModel
                   : restoredProvider === 'opencode'
                   ? restoredOpenCodeModel
                   : restoredProvider === 'pi'
@@ -486,21 +560,33 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
           // The mode is only sent to Java on an explicit user switch
           // (handleModeSelect → set_mode).
           sendBridgeEvent('set_codex_fast_mode', restoredCodexFastMode);
+          sendBridgeEvent('set_codex_collaboration_mode', restoredCodexSettings.collaborationMode);
+          sendBridgeEvent('set_codex_approval_preset', restoredCodexSettings.approvalPreset);
+          sendBridgeEvent('set_codex_sandbox_selection', JSON.stringify({
+            selection: restoredCodexSettings.sandboxSelection,
+            source: restoredCodexSettings.sandboxSource,
+          }));
           if (restoredProvider === 'dsh') {
             sendBridgeEvent('set_dsh_preset', restoredDshPreset);
           }
         } else {
           syncRetryCount++;
           if (syncRetryCount < MAX_SYNC_RETRIES) {
-            setTimeout(syncToBackend, 100);
+            syncTimer = window.setTimeout(syncToBackend, 100);
           }
         }
       };
-      setTimeout(syncToBackend, 200);
+      syncTimer = window.setTimeout(syncToBackend, 200);
     } catch {
       // Failed to load model selection state — fall back to defaults already
       // set by individual slice hooks.
     }
+    return () => {
+      syncCancelled = true;
+      if (syncTimer !== undefined) {
+        window.clearTimeout(syncTimer);
+      }
+    };
   }, []);
 
   // Persist snapshot whenever any of the persisted keys change.
@@ -536,6 +622,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
           grokModel: selectedGrokModel,
           kimiModel: selectedKimiModel,
           miniMaxModel: selectedMiniMaxModel,
+          zcodeModel: selectedZcodeModel,
           openCodeModel: selectedOpenCodeModel,
           piModel: selectedPiModel,
           ompModel: selectedOmpModel,
@@ -543,6 +630,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
           grokPermissionMode,
           kimiPermissionMode,
           miniMaxPermissionMode,
+          zcodePermissionMode,
           openCodePermissionMode,
           piPermissionMode,
           ompPermissionMode,
@@ -551,6 +639,10 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
           reasoningEffort,
           codexFastMode,
           dshPreset,
+          codexCollaborationMode,
+          codexApprovalPreset,
+          codexSandboxSelection,
+          codexSandboxSource,
         }));
       } catch {
         // Failed to save model selection state — non-fatal.
@@ -572,6 +664,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
     selectedGrokModel,
     selectedKimiModel,
     selectedMiniMaxModel,
+    selectedZcodeModel,
     selectedOpenCodeModel,
     selectedPiModel,
     selectedOmpModel,
@@ -579,6 +672,7 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
     grokPermissionMode,
     kimiPermissionMode,
     miniMaxPermissionMode,
+    zcodePermissionMode,
     openCodePermissionMode,
     piPermissionMode,
     ompPermissionMode,
@@ -587,5 +681,9 @@ export function useModelStatePersistence(options: UseModelStatePersistenceOption
     reasoningEffort,
     codexFastMode,
     dshPreset,
+    codexCollaborationMode,
+    codexApprovalPreset,
+    codexSandboxSelection,
+    codexSandboxSource,
   ]);
 }

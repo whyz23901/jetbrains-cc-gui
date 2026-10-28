@@ -460,6 +460,52 @@ public class ProviderManager {
     }
 
     /**
+     * Get alwaysThinkingEnabled from the currently active provider's settingsConfig.
+     * Returns {@code null} when unset or on read failure — callers decide the default.
+     */
+    public Boolean getAlwaysThinkingEnabledInActiveProvider() {
+        try {
+            JsonObject config = configReader.apply(null);
+            if (config == null || !config.has("claude") || config.get("claude").isJsonNull()) {
+                return null;
+            }
+
+            JsonObject claude = config.getAsJsonObject("claude");
+            if (!claude.has("current") || claude.get("current").isJsonNull()) {
+                return null;
+            }
+
+            String currentId = claude.get("current").getAsString();
+            if (currentId == null || currentId.trim().isEmpty()) {
+                return null;
+            }
+
+            if (!claude.has("providers") || claude.get("providers").isJsonNull()) {
+                return null;
+            }
+
+            JsonObject providers = claude.getAsJsonObject("providers");
+            if (!providers.has(currentId) || providers.get(currentId).isJsonNull()) {
+                return null;
+            }
+
+            JsonObject provider = providers.getAsJsonObject(currentId);
+            if (!provider.has("settingsConfig") || provider.get("settingsConfig").isJsonNull()) {
+                return null;
+            }
+
+            JsonObject settingsConfig = provider.getAsJsonObject("settingsConfig");
+            if (settingsConfig.has("alwaysThinkingEnabled")
+                    && !settingsConfig.get("alwaysThinkingEnabled").isJsonNull()) {
+                return settingsConfig.get("alwaysThinkingEnabled").getAsBoolean();
+            }
+        } catch (Exception e) {
+            LOG.warn("Failed to read alwaysThinkingEnabled from active provider: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /**
      * Apply the active provider to Claude settings.json.
      * <p>
      * Uses {@link ClaudeSettingsSyncPlan} (same rules as vscode-cc-gui): skips
@@ -494,7 +540,56 @@ public class ProviderManager {
             LOG.info("[ProviderManager] No active provider to sync to .claude/settings.json");
             return;
         }
-        claudeSettingsManager.applyProviderToClaudeSettings(activeProvider);
+        applyProviderToClaudeSettings(activeProvider);
+    }
+
+    /**
+     * Apply {@code provider} to settings.json, removing the env values the provider that last
+     * wrote the file put there (unless the user has changed them since).
+     */
+    public void applyProviderToClaudeSettings(JsonObject provider) throws IOException {
+        applyProviderToClaudeSettings(provider, null);
+    }
+
+    /**
+     * Re-apply a provider that was just edited. The saved config already holds the edit, so the
+     * values it wrote into settings.json come from {@code providerBeforeEdit}; a value removed
+     * by the edit is then removed from settings.json as well.
+     *
+     * @param provider           the provider to apply
+     * @param providerBeforeEdit a copy of the same provider taken before the edit, or null
+     */
+    public void applyProviderToClaudeSettings(JsonObject provider, JsonObject providerBeforeEdit) throws IOException {
+        claudeSettingsManager.applyProviderToClaudeSettings(provider, id ->
+                providerBeforeEdit != null && id.equals(idOf(providerBeforeEdit))
+                        ? providerBeforeEdit
+                        : getSavedClaudeProvider(id));
+    }
+
+    private static String idOf(JsonObject provider) {
+        return provider.has("id") && provider.get("id").isJsonPrimitive() ? provider.get("id").getAsString() : null;
+    }
+
+    /**
+     * @param id a provider id
+     * @return a copy of the saved provider with that id (with {@code id} set), or null when there is none
+     */
+    public JsonObject getSavedClaudeProvider(String id) {
+        JsonObject config = configReader.apply(null);
+        if (id == null || config == null || !config.has("claude") || !config.get("claude").isJsonObject()) {
+            return null;
+        }
+        JsonObject claude = config.getAsJsonObject("claude");
+        if (!claude.has("providers") || !claude.get("providers").isJsonObject()) {
+            return null;
+        }
+        JsonObject providers = claude.getAsJsonObject("providers");
+        if (!providers.has(id) || !providers.get(id).isJsonObject()) {
+            return null;
+        }
+        JsonObject provider = providers.getAsJsonObject(id).deepCopy();
+        provider.addProperty("id", id);
+        return provider;
     }
 
     /**
@@ -776,7 +871,12 @@ public class ProviderManager {
                         "ANTHROPIC_MODEL",
                         "ANTHROPIC_DEFAULT_SONNET_MODEL",
                         "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+                        "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"
                     };
                     for (String key : modelMappingKeys) {
                         if (fullEnv.has(key) && !fullEnv.get(key).isJsonNull()) {
@@ -843,8 +943,10 @@ public class ProviderManager {
             currentId = claude.get("current").getAsString();
         }
 
+        // An explicitly empty id is a valid disabled state and must not trigger a config rewrite.
         boolean invalidCurrent = currentId == null
-                || (!LOCAL_SETTINGS_PROVIDER_ID.equals(currentId)
+                || (!currentId.isEmpty()
+                    && !LOCAL_SETTINGS_PROVIDER_ID.equals(currentId)
                     && !CLI_LOGIN_PROVIDER_ID.equals(currentId)
                     && !providers.has(currentId));
 

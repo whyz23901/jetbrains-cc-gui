@@ -14,8 +14,45 @@ import {
 } from '../services/claude/persistent-query-service.js';
 import {
   getSessionMessages as claudeGetSessionMessages,
+  getSessionMessagesPage as claudeGetSessionMessagesPage,
   getLatestUserMessage as claudeGetLatestUserMessage
 } from '../services/claude/session-service.js';
+import { listModels } from '../services/claude/models-service.js';
+
+/**
+ * Coerce an optional turn cursor supplied through stdin JSON or as a positional
+ * CLI argument.
+ *
+ * Returns null when the caller supplied no cursor (the caller then wants the
+ * latest page) and when the value is not a non-negative integer, so an unusable
+ * cursor degrades to the latest page instead of reaching the pagination layer.
+ *
+ * The distinction matters because Number(null) === 0 and Number('') === 0:
+ * coercing before ruling out "absent" turns "no cursor" into "the page before
+ * turn 0", which buildSessionMessagesPagePayload answers with an empty page.
+ *
+ * No upper bound is applied here: only buildSessionMessagesPagePayload knows
+ * the history length, and it answers any cursor beyond it with the latest page
+ * plus cursorReset. The Java client depends on that flag, because it replaces
+ * its transcript on a reset and prepends the page otherwise.
+ *
+ * @param {unknown} raw cursor value from stdin JSON or argv
+ * @returns {number|null} non-negative integer turn index, or null when absent/unusable
+ */
+export function parseOptionalTurnCursor(raw) {
+  if (typeof raw === 'number') {
+    return Number.isInteger(raw) && raw >= 0 ? raw : null;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed === '') {
+      return null;
+    }
+    const parsed = Number(trimmed);
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+  }
+  return null;
+}
 
 /**
  * Execute a Claude specific command.
@@ -25,6 +62,10 @@ import {
  */
 export async function handleClaudeCommand(command, args, stdinData) {
   switch (command) {
+    case 'listModels':
+      listModels();
+      break;
+
     case 'send': {
       if (stdinData && stdinData.message !== undefined) {
         // Include streaming and disableThinking when destructuring
@@ -68,6 +109,20 @@ export async function handleClaudeCommand(command, args, stdinData) {
     case 'getSession':
       await claudeGetSessionMessages(args[0], args[1]);
       break;
+
+    case 'getSessionPage': {
+      // Paginated history load. An absent cursor means "the latest page" and an
+      // unusable one degrades to it as well, so a malformed cursor never leaves
+      // the user with an empty chat; the Java side additionally falls back to
+      // the full-history getSession path when the page request fails.
+      const sessionId = stdinData?.sessionId || args[0];
+      const cwd = stdinData?.cwd || args[1] || null;
+      const beforeTurn = parseOptionalTurnCursor(stdinData?.beforeTurn ?? args[2]);
+      const parsedLimit = Number(stdinData?.limit ?? args[3]);
+      const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 200) : 30;
+      await claudeGetSessionMessagesPage(sessionId, cwd, beforeTurn, limit);
+      break;
+    }
 
     case 'getLatestUserMessage':
       await claudeGetLatestUserMessage(args[0], args[1]);
@@ -122,5 +177,5 @@ export async function handleClaudeCommand(command, args, stdinData) {
 }
 
 export function getClaudeCommandList() {
-  return ['send', 'sendWithAttachments', 'getSession', 'getLatestUserMessage', 'rewindFiles', 'getMcpServerStatus', 'getMcpServerTools', 'resetRuntime', 'getContextUsage'];
+  return ['send', 'sendWithAttachments', 'listModels', 'getSession', 'getLatestUserMessage', 'rewindFiles', 'getMcpServerStatus', 'getMcpServerTools', 'resetRuntime', 'getContextUsage'];
 }

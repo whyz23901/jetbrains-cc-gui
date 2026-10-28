@@ -177,7 +177,7 @@ test('exec.result maps to result event with sessionId', () => {
   });
   assert.deepEqual(parseMiniMaxStreamLine(line), {
     kind: 'result', sessionId: 'mvs_abc123', status: 'succeeded',
-    failed: false, errorMessage: '',
+    failed: false, errorMessage: '', answer: 'done',
   });
 });
 
@@ -187,7 +187,7 @@ test('exec.result with failed status is flagged and carries the error text', () 
   });
   assert.deepEqual(parseMiniMaxStreamLine(line), {
     kind: 'result', sessionId: '', status: 'failed',
-    failed: true, errorMessage: 'permission denied',
+    failed: true, errorMessage: 'permission denied', answer: '',
   });
 });
 
@@ -417,27 +417,29 @@ test('real exec.completed result maps to a result event read from the nested res
     status: result.status,
     failed: result.status.toLowerCase() !== 'succeeded',
     errorMessage: '',
+    answer: typeof result.answer === 'string' ? result.answer : '',
   });
 });
 
 test('legacy exec.result and 0.5.5 exec.completed produce isomorphic result events', () => {
-  // 8(3): one assertion set, run over both protocols. The five result fields
+  // 8(3): one assertion set, run over both protocols. The six result fields
   // are compared individually, so a shape difference cannot hide.
   const assertResultEvent = (line, expected) => {
     const event = parseMiniMaxStreamLine(line);
     assert.deepEqual(Object.keys(event).sort(), [
-      'errorMessage', 'failed', 'kind', 'sessionId', 'status',
+      'answer', 'errorMessage', 'failed', 'kind', 'sessionId', 'status',
     ]);
     assert.equal(event.kind, 'result');
     assert.equal(event.sessionId, expected.sessionId);
     assert.equal(event.status, expected.status);
     assert.equal(event.failed, expected.failed);
     assert.equal(event.errorMessage, expected.errorMessage);
+    assert.equal(event.answer, expected.answer);
   };
 
   assertResultEvent(
     JSON.stringify({ type: 'exec.result', sessionId: 'mvs_same', status: 'succeeded', answer: 'ok' }),
-    { sessionId: 'mvs_same', status: 'succeeded', failed: false, errorMessage: '' },
+    { sessionId: 'mvs_same', status: 'succeeded', failed: false, errorMessage: '', answer: 'ok' },
   );
   const raw = firstRaw((e) => e.type === 'exec.completed');
   const result = JSON.parse(raw).result;
@@ -446,6 +448,7 @@ test('legacy exec.result and 0.5.5 exec.completed produce isomorphic result even
     status: result.status,
     failed: result.status.toLowerCase() !== 'succeeded',
     errorMessage: '',
+    answer: typeof result.answer === 'string' ? result.answer : '',
   });
 
   // Both shapes reach the same handler branch, so the session marker is

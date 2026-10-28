@@ -12,8 +12,8 @@ import {
 } from '../../config/api-config.js';
 import { selectWorkingDirectory } from '../../utils/path-utils.js';
 import {
-  mapModelIdToSdkName,
   resolveModelFromSettings,
+  resolveSdkModelName,
   setModelEnvironmentVariables
 } from '../../utils/model-utils.js';
 import { canUseTool } from '../../permission-handler.js';
@@ -29,6 +29,7 @@ import {
   cleanupStaleAnonymousRuntimes,
   cleanupStaleSessionRuntimes,
   disposeRuntime,
+  notifyExpiredResume,
   registerRuntimeSession,
   acquireRuntime,
   applyDynamicControls,
@@ -120,13 +121,16 @@ function buildSystemPromptAppend(params) {
 }
 
 function resolveRequestModelState(modelId, settingsEnv) {
+  const resolvedModelId = resolveModelFromSettings(modelId, settingsEnv);
   return {
-    sdkModelName: mapModelIdToSdkName(modelId),
-    resolvedModelId: resolveModelFromSettings(modelId, settingsEnv),
+    // Exact id, not the family alias: the settings override blanks the
+    // ANTHROPIC_DEFAULT_*_MODEL vars the alias would otherwise resolve through.
+    sdkModelName: resolveSdkModelName(modelId, resolvedModelId),
+    resolvedModelId,
   };
 }
 
-function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxThinkingTokens, reasoningEffort, streamingEnabled, systemPromptAppend, requestedSessionId, mcpServers, modelId) {
+function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxThinkingTokens, reasoningEffort, streamingEnabled, systemPromptAppend, requestedSessionId, mcpServers, modelId, settingsEnv) {
   const claudeCliOverride = getClaudeCliPathOverride();
   return {
     cwd: workingDirectory,
@@ -135,7 +139,7 @@ function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxTh
     maxTurns: 1000,
     enableFileCheckpointing: true,
     env: buildCliEnv(),
-    settings: buildWebviewControlledSettingsOverride(modelId),
+    settings: buildWebviewControlledSettingsOverride(modelId, settingsEnv),
     ...(reasoningEffort && { effort: reasoningEffort }),
     ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
     ...(streamingEnabled && { includePartialMessages: true }),
@@ -161,10 +165,10 @@ function buildQueryOptions(workingDirectory, sdkModelName, permissionMode, maxTh
   };
 }
 
-async function buildUserMessage(params, withAttachments, requestedSessionId, resolvedModelId = null) {
+async function buildUserMessage(params, withAttachments, requestedSessionId) {
   if (withAttachments) {
     const attachments = await loadAttachments({ attachments: params.attachments || [] });
-    const contentBlocks = await buildContentBlocks(attachments, params.message || '', resolvedModelId);
+    const contentBlocks = await buildContentBlocks(attachments, params.message || '');
     return {
       type: 'user',
       session_id: requestedSessionId || '',
@@ -207,7 +211,7 @@ async function buildRequestContext(params, withAttachments, overrides = {}) {
   const settings = overrides.settings ?? loadClaudeSettings();
   const modelId = params.model || null;
   const { sdkModelName, resolvedModelId } = resolveRequestModelState(modelId, settings?.env);
-  setModelEnvironmentVariables(resolvedModelId, modelId);
+  setModelEnvironmentVariables(resolvedModelId, modelId, settings?.env);
 
   const permissionMode = normalizePermissionMode(params.permissionMode);
   const streamingEnabled = resolveStreamingEnabled(params, settings);
@@ -220,10 +224,10 @@ async function buildRequestContext(params, withAttachments, overrides = {}) {
   const options = buildQueryOptions(
     workingDirectory, sdkModelName, permissionMode,
     maxThinkingTokens, reasoningEffort, streamingEnabled, systemPromptAppend, requestedSessionId,
-    mcpServers, modelId
+    mcpServers, modelId, settings?.env
   );
 
-  const userMessage = await buildUserMessage(params, withAttachments, requestedSessionId, resolvedModelId);
+  const userMessage = await buildUserMessage(params, withAttachments, requestedSessionId);
 
   const runtimeSignature = buildRuntimeSignature(options, systemPromptAppend, streamingEnabled, runtimeSessionEpoch, modelId);
   console.log('[LIFECYCLE] buildRequestContext sessionId=' + (requestedSessionId || '(new)')
@@ -246,17 +250,27 @@ async function buildRequestContext(params, withAttachments, overrides = {}) {
   };
 }
 
-// Background cleanup of idle session runtimes, decoupled from the request hot path.
-// Runs every 5 minutes instead of on every acquireRuntime call to avoid O(n) scans.
-const _sessionCleanupTimer = setInterval(async () => {
-  await cleanupStaleSessionRuntimes({ registerActiveQueryResult, removeSession });
+// Background cleanup of every idle runtime, including anonymous runtimes created
+// before Claude returns a session ID. Guard against overlapping disposal sweeps.
+let _runtimeCleanupInFlight = false;
+const _runtimeCleanupTimer = setInterval(async () => {
+  if (_runtimeCleanupInFlight) return;
+  _runtimeCleanupInFlight = true;
+  try {
+    await cleanupStaleAnonymousRuntimes({ registerActiveQueryResult, removeSession });
+    await cleanupStaleSessionRuntimes({ registerActiveQueryResult, removeSession });
+  } catch (error) {
+    console.error('[DAEMON] Idle runtime cleanup failed:', error?.message || error);
+  } finally {
+    _runtimeCleanupInFlight = false;
+  }
 }, SESSION_CLEANUP_INTERVAL_MS);
 // unref() so the timer does not prevent natural process exit
-_sessionCleanupTimer.unref();
+_runtimeCleanupTimer.unref();
 
   async function executeTurn(runtime, requestContext, turnMeta) {
   if (!runtime || runtime.closed) {
-    const err = new Error('Runtime is closed');
+    const err = runtime?.terminalError || new Error('Runtime is closed');
     err.runtimeTerminated = true;
     throw err;
   }
@@ -308,6 +322,7 @@ _sessionCleanupTimer.unref();
       } catch (error) {
         const wrapped = new Error(error?.message || String(error));
         wrapped.runtimeTerminated = true;
+        wrapped.resumeExpiredNotified = error?.resumeExpiredNotified === true;
         throw wrapped;
       }
 
@@ -594,6 +609,7 @@ async function sendInternal(params, withAttachments) {
       turnMeta.state.streamEnded = true;
     }
 
+    let expiredResume = false;
     if (wasAborted) {
       // Graceful abort — output a clean result instead of SEND_ERROR so Java side
       // does not show an error toast. Also emit elapsed time like Codex does.
@@ -603,11 +619,13 @@ async function sendInternal(params, withAttachments) {
         elapsedMs
       }));
     } else {
+      expiredResume = notifyExpiredResume(requestContext, error, runtime);
       emitSendError(runtime, error, requestContext);
     }
 
-    // Only dispose if not already disposed by abort
-    if (runtime && !runtime.closed && error?.runtimeTerminated) {
+    // A failed resume must retire its query too, even if the SDK returned an
+    // error result without closing the iterator.
+    if (runtime && !runtime.closed && (error?.runtimeTerminated || expiredResume)) {
       await disposeRuntime(runtime, { removeSession });
     }
   }
@@ -817,7 +835,11 @@ export async function getContextUsagePersistent(params = {}) {
       // Fast path: reuse existing runtime with minimal model sync.
       // Only map the model ID and call setModel if needed - skip full buildRequestContext
       // which would unnecessarily load MCP config, settings, etc.
-      setModelEnvironmentVariables(targetModel, modelId);
+      // Pass settings.env here as well: process.env is daemon-wide shared state, so writing
+      // only the current tier would leave tiers spread by an earlier turn in place, out of sync
+      // with this turn's settings.json. setModelEnvironmentVariables() also clears tiers the
+      // current settings no longer configure, which is what keeps this path in agreement.
+      setModelEnvironmentVariables(targetModel, modelId, settings?.env);
     }
 
     if (typeof runtime.query?.setModel === 'function') {
@@ -857,6 +879,9 @@ export async function shutdownPersistentRuntimes() {
   resetCachedQueryFn();
 }
 
+// Lightweight lifecycle snapshot used by the outer daemon idle reaper.
+export { getSnapshot };
+
 export const __testing = {
   async resetState() {
     await shutdownPersistentRuntimes();
@@ -865,6 +890,7 @@ export const __testing = {
   setQueryFn(queryFn) {
     setCachedQueryFn(queryFn);
   },
+  notifyExpiredResume,
   async buildRequestContext(params = {}, withAttachments = false, overrides = {}) {
     return buildRequestContext(params, withAttachments, overrides);
   },

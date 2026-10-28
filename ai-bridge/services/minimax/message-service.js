@@ -360,10 +360,13 @@ function buildMiniMaxResultEvent(payload) {
   const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
   const status = typeof payload.status === 'string' ? payload.status : '';
   const errorMessage = extractErrorText(payload);
+  // The envelope may carry the full answer text; kept so a run that streamed
+  // nothing can still publish it once (see createResultKindHandler).
+  const answer = typeof payload.answer === 'string' ? payload.answer : '';
   // Anything other than an explicit success counts as failure: the stream
   // is terminated on this line, so a failed run must not end in silence.
   const failed = status !== '' && status.toLowerCase() !== 'succeeded';
-  return { kind: 'result', sessionId, status, failed, errorMessage };
+  return { kind: 'result', sessionId, status, failed, errorMessage, answer };
 }
 
 /**
@@ -834,10 +837,19 @@ function createUsageKindHandler(state, publish) {
 }
 
 /** The terminal branch: record that a result arrived, then report its failure. */
+// Dedup key for a result-carried answer that no streamed item id owns.
+const ANON_CONTENT_KEY = '<anon-agent_message>';
+
 function createResultKindHandler(state, publish) {
   return (event) => {
     state.sawResult = true;
     publish.session(event.sessionId);
+    // Final fallback: a run that streamed no content at all but whose result
+    // envelope carries the full answer emits it exactly once.
+    if (event.answer && state.streamedContentMessageIds.size === 0) {
+      state.streamedContentMessageIds.add(ANON_CONTENT_KEY);
+      publish.content(event.answer);
+    }
     // shouldTerminate kills the CLI on this line and suppresses the
     // non-zero exit code, so a failed run with no streamed output would
     // otherwise end the stream in silence — surface it explicitly.

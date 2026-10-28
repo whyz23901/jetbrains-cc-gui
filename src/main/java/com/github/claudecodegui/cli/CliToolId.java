@@ -4,6 +4,7 @@ package com.github.claudecodegui.cli;
  * Supported headless CLI tools shown in Settings → Provider Management → CLI.
  */
 public enum CliToolId {
+    CODEX("codex", "Codex CLI", "codex", null),
     GROK("grok", "Grok CLI", "grok", null),
     KIMI("kimi", "Kimi CLI", "kimi", null),
     OPENCODE("opencode", "OpenCode", "opencode", null),
@@ -11,7 +12,11 @@ public enum CliToolId {
     OMP("omp", "OMP CLI", "omp", null),
     DSH("dsh", "DeepSeek Harness", "dsh", null),
     // Official installer exposes `minimax`; npm global installs expose `mcode`.
-    MINIMAX("minimax", "MiniMax Code", "minimax", "mcode");
+    MINIMAX("minimax", "MiniMax Code", "minimax", "mcode"),
+    // ZCode has no PATH binary — the app-server entry (zcode.cjs) lives inside
+    // the desktop app bundle; CliStatusDetector resolves it from well-known
+    // install locations (the binary name is only a display/fallback label).
+    ZCODE("zcode", "ZCode", "zcode", null);
 
     private final String id;
     private final String displayName;
