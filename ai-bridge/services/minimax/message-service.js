@@ -122,7 +122,6 @@ import {
   safePromptArg,
 } from '../../utils/marker-protocol.js';
 import {
-  buildKimiPromptWithImages,
   cleanupMaterializedImagePaths,
   materializeImageAttachments,
 } from '../../utils/cli-image-input.js';
@@ -665,7 +664,7 @@ export function isMiniMaxTerminalLine(line) {
   return value.type === 'exec.completed' || value.type === 'exec.result';
 }
 
-function buildMiniMaxArgs({ message, sessionId, model, permissionMode, cwd }) {
+export function buildMiniMaxArgs({ message, sessionId, model, permissionMode, cwd, imagePaths }) {
   const args = [
     'exec',
     '--output-format', 'stream-json',
@@ -680,6 +679,15 @@ function buildMiniMaxArgs({ message, sessionId, model, permissionMode, cwd }) {
   }
   if (cwd && cwd !== 'undefined' && cwd !== 'null') {
     args.push('--cwd', cwd);
+  }
+  // Native multimodal attachments: `mcode exec --file <path>` (repeatable)
+  // attaches the image to the run so the model sees it directly. Flags stay
+  // before the prompt positional — mcode's parser accepts options first, and
+  // the prompt must remain the last argv token.
+  for (const imagePath of Array.isArray(imagePaths) ? imagePaths : []) {
+    if (imagePath && typeof imagePath === 'string') {
+      args.push('--file', imagePath);
+    }
   }
   args.push(safePromptArg(message));
   return args;
@@ -967,7 +975,6 @@ export async function sendMessage(
   try {
     imagePaths = await materializeImageAttachments(attachments);
     if (imagePaths.length > 0) {
-      promptText = buildKimiPromptWithImages(promptText, imagePaths);
       logDebug('image attachments', imagePaths.length, imagePaths);
     }
   } catch (err) {
@@ -981,6 +988,7 @@ export async function sendMessage(
     model,
     permissionMode,
     cwd,
+    imagePaths,
   });
   // Same CR/LF refusal as the parser: a session id from the caller reaches the
   // marker before the CLI even starts.

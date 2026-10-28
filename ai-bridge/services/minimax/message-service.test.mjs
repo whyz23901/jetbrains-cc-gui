@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
+  buildMiniMaxArgs,
   createMiniMaxEventHandler,
   flushMiniMaxUnknownTypeCounts,
   getMiniMaxSkippedShapeCounts,
@@ -1353,4 +1354,43 @@ test('markers stay on stdout and debug output stays on stderr', () => {
   assert.equal(stderr.includes('[USAGE]'), false);
   assert.ok(stderr.includes('[DEBUG][MiniMax]'), 'the aggregate must be announced on stderr');
   resetMiniMaxUnknownTypeCounts();
+});
+
+// ---------------------------------------------------------------------------
+// mcode exec argv: native image attachments via --file
+// ---------------------------------------------------------------------------
+
+test('buildMiniMaxArgs attaches each image with --file before the prompt', () => {
+  const args = buildMiniMaxArgs({
+    message: 'what color?',
+    sessionId: 'mvs_abc',
+    model: '',
+    permissionMode: 'bypassPermissions',
+    cwd: 'F:/proj',
+    imagePaths: ['C:/tmp/a.png', 'C:/tmp/b.png'],
+  });
+  const promptIndex = args.indexOf('what color?');
+  const fileA = args.indexOf('--file');
+  assert.ok(fileA > 0, '--file must be present');
+  assert.equal(args[fileA + 1], 'C:/tmp/a.png');
+  assert.equal(args[args.indexOf('--file', fileA + 1) + 1], 'C:/tmp/b.png');
+  // Flags before the positional prompt, prompt stays the last token.
+  assert.ok(promptIndex > args.lastIndexOf('--file') + 1);
+  assert.equal(args[args.length - 1], 'what color?');
+  // No Kimi-style prompt injection remains: the raw text is passed through.
+  assert.equal(args.includes('what color?'), true);
+});
+
+test('buildMiniMaxArgs without images has no --file and ignores falsy entries', () => {
+  const noImages = buildMiniMaxArgs({
+    message: 'hi', sessionId: '', model: '', permissionMode: '', cwd: '',
+  });
+  assert.equal(noImages.includes('--file'), false);
+  assert.equal(noImages[noImages.length - 1], 'hi');
+
+  const withFalsy = buildMiniMaxArgs({
+    message: 'hi', sessionId: '', model: '', permissionMode: '', cwd: '',
+    imagePaths: ['', null, undefined, 'C:/tmp/ok.png'],
+  });
+  assert.deepEqual(withFalsy.slice(withFalsy.indexOf('--file'), -1), ['--file', 'C:/tmp/ok.png']);
 });
