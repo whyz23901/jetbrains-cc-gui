@@ -257,7 +257,7 @@ test('decodeCliOutput keeps valid UTF-8 and recovers GBK stderr', () => {
   assert.match(decoded, /命令/);
 });
 
-test('resolveCliSpawn launches spaced .cmd shims via cmd basename + PATH', () => {
+test('resolveCliSpawn launches spaced .cmd shims via cmd with the quoted full path', () => {
   const env = { PATH: 'C:\\Windows\\system32', ComSpec: 'C:\\Windows\\system32\\cmd.exe' };
   const invocation = resolveCliSpawn(
     'C:\\Program Files\\nodejs\\opencode.cmd',
@@ -268,11 +268,11 @@ test('resolveCliSpawn launches spaced .cmd shims via cmd basename + PATH', () =>
   assert.equal(invocation.file, 'C:\\Windows\\system32\\cmd.exe');
   assert.equal(invocation.options.shell, false);
   assert.equal(invocation.options.windowsVerbatimArguments, true);
-  // /s strips the outer quotes, leaving `"opencode.cmd" "models"`.
-  assert.deepEqual(invocation.args, ['/d', '/s', '/c', '""opencode.cmd" "models""']);
+  // /s strips the outer quotes, leaving the shim's quoted full path as one
+  // command token — required so %~dp0 inside the shim resolves to the
+  // script's own directory, not the child's CWD.
+  assert.deepEqual(invocation.args, ['/d', '/s', '/c', '""C:\\Program Files\\nodejs\\opencode.cmd" "models""']);
   assert.match(invocation.options.env.PATH, /^C:\\Program Files\\nodejs;/);
-  // The command token must not contain the spaced prefix that cmd splits on.
-  assert.equal(invocation.args[3].includes('C:\\Program'), false);
 });
 
 test('resolveCliSpawn strips a previously quoted .cmd path', () => {
@@ -282,12 +282,38 @@ test('resolveCliSpawn strips a previously quoted .cmd path', () => {
     { env: { PATH: 'C:\\Windows\\system32' } },
     true,
   );
-  assert.equal(invocation.args[3].includes('C:\\Program'), false);
+  assert.equal(invocation.args[3], '""C:\\Program Files\\nodejs\\opencode.cmd" "models""');
   assert.match(invocation.args[3], /opencode\.cmd/);
 });
 
-test('resolveCliSpawn leaves .exe and non-Windows targets as a direct spawn', () => {
-  const exe = resolveCliSpawn(
+test('resolveCliSpawn lets a %~dp0-based shim read its own directory (regression)', async () => {
+  // Regression for the MiniMax mcode failure: a shim resolved through
+  // MINIMAX_BIN reads sibling files via %~dp0. Invoking it by bare name
+  // through a PATH lookup made %~dp0 expand to the child's CWD, so the run
+  // died with cmd's localized "file not found" and exit 1. The quoted
+  // full-path invocation must give the shim its real directory.
+  if (process.platform !== 'win32') return;
+  const { spawn } = await import('node:child_process');
+  const root = mkdtempSync(join(tmpdir(), 'cc-gui-dp0-spawn-'));
+  mkdirSync(join(root, 'inner dir'), { recursive: true });
+  const marker = 'sibling-present';
+  writeFileSync(join(root, 'inner dir', 'release'), marker);
+  const shim = join(root, 'inner dir', 'mcode.cmd');
+  writeFileSync(shim, '@echo off\r\nset /p REL=<"%~dp0release"\r\n echo %REL%\r\n');
+
+  const invocation = resolveCliSpawn(shim, [], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const stdout = await new Promise((resolve, reject) => {
+    const child = spawn(invocation.file, invocation.args, invocation.options);
+    let out = '';
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    child.on('error', reject);
+    child.on('close', (code) => resolve(`${out} [exit=${code}]`));
+  });
+  assert.match(stdout, new RegExp(marker));
+  assert.match(stdout, /exit=0/);
+});
+
+test('resolveCliSpawn leaves .exe and non-Windows targets as a direct spawn', () => {  const exe = resolveCliSpawn(
     'C:\\Program Files\\nodejs\\opencode.exe',
     ['models'],
     { env: { PATH: 'C:\\Windows\\system32' } },
@@ -318,7 +344,8 @@ test('resolveCliSpawn file-redirect quotes both the shim and the dest path', () 
   assert.match(invocation.args[3], /opencode\.cmd/);
   assert.match(invocation.args[3], />/);
   assert.match(invocation.args[3], /models\.txt/);
-  assert.equal(invocation.args[3].includes('C:\\Program'), false);
+  // Full quoted shim path (spaces included) as the command token.
+  assert.equal(invocation.args[3].startsWith('""C:\\Program Files\\nodejs\\opencode.cmd"'), true);
 });
 
 test('whichViaLoginShell rejects unsafe binary names without spawning', () => {

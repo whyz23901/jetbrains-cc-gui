@@ -115,8 +115,15 @@ function prependPathDir(env, dir) {
  * command again (`cmd /s /c "…"`), and a second quote pair becomes `""C:\Program`.
  *
  * Instead, launch `cmd.exe /d /s /c` ourselves with `windowsVerbatimArguments`
- * and invoke the shim by **basename** after prepending its directory to PATH.
- * That keeps spaces out of the command token entirely.
+ * and invoke the shim by its **quoted full path** after prepending its
+ * directory to PATH. The full path is required, not cosmetic: a batch executed
+ * via a PATH lookup by bare name receives `%0` as typed, so `%~dp0` inside the
+ * script expands to the child process's CWD instead of the script's own
+ * directory — every `%~dp0`-based launcher (npm shims, the mcode release
+ * manager reading `<"%~dp0current"`) then reads its sibling files from the
+ * wrong place and dies with cmd's localized "file not found" + exit 1.
+ * `/s` strips exactly the outer quote pair, so the quoted single token
+ * survives spaces and parentheses in the path.
  *
  * @param {string} bin
  * @param {string[]} [args]
@@ -139,14 +146,13 @@ export function resolveCliSpawn(
 
   if (needsCmd) {
     const looksLikePath = pathWin32.isAbsolute(normalized) || /[\\/]/.test(normalized);
-    // Invoke shims by basename so `C:\Program Files\...` never appears as the
-    // command token. Keep the full path for real `.exe` binaries.
-    const invokeName = isShim && looksLikePath ? pathWin32.basename(normalized) : normalized;
     const env = prependPathDir(
       { ...(options.env || process.env) },
       looksLikePath ? pathWin32.dirname(normalized) : '',
     );
-    let command = [invokeName, ...args].map(quoteCmdArg).join(' ');
+    // See the doc block: the shim MUST be invoked by its quoted full path —
+    // a bare-name PATH lookup leaves %~dp0 pointing at the child's CWD.
+    let command = [normalized, ...args].map(quoteCmdArg).join(' ');
     if (redirectTo) command += ` > ${quoteCmdArg(redirectTo)}`;
     return {
       file: env.ComSpec || env.COMSPEC || process.env.ComSpec || 'cmd.exe',
