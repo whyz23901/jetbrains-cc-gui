@@ -297,4 +297,29 @@ public class MiniMaxHistoryReaderTest {
         assertFalse(usage.has("cache_read"));
         assertFalse(usage.has("context_window"));
     }
+
+    @Test
+    public void resolveMinimaxHomeHonorsDataDirBeforeDefault() {
+        // The official Windows shims export MINIMAX_DATA_DIR and the CLI keeps
+        // config + v2/sessions there; history must read the same place.
+        assertEquals(Path.of("D:\\tools\\mm-data"),
+                MiniMaxHistoryReader.resolveMinimaxHome(null, null, "D:\\tools\\mm-data", "C:\\Users\\tester"));
+        // Whitespace is trimmed like the other overrides.
+        assertEquals(Path.of("D:\\tools\\mm-data"),
+                MiniMaxHistoryReader.resolveMinimaxHome(null, null, "  D:\\tools\\mm-data  ", "C:\\Users\\tester"));
+    }
+
+    @Test
+    public void resolveMinimaxHomeOverridesOutrankDataDir() {
+        assertEquals(Path.of("E:\\plugin-home"),
+                MiniMaxHistoryReader.resolveMinimaxHome("E:\\plugin-home", null, "D:\\tools\\mm-data", "C:\\Users\\tester"));
+        assertEquals(Path.of("E:\\plugin-home"),
+                MiniMaxHistoryReader.resolveMinimaxHome(null, "E:\\plugin-home", "D:\\tools\\mm-data", "C:\\Users\\tester"));
+    }
+
+    @Test
+    public void resolveMinimaxHomeFallsBackToDefaultDotMinimax() {
+        assertEquals(Path.of("C:\\Users\\tester", ".minimax"),
+                MiniMaxHistoryReader.resolveMinimaxHome(null, null, null, "C:\\Users\\tester"));
+    }
 }

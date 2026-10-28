@@ -70,15 +70,26 @@ public class MiniMaxHistoryReader {
     }
 
     private static Path defaultMiniMaxHome() {
-        String home = NodeDetector.resolveHomeForFileOps();
-        String override = firstNonBlank(
+        return resolveMinimaxHome(
                 System.getenv("MINIMAX_CODE_HOME"),
-                System.getenv("MINIMAX_HOME")
-        );
+                System.getenv("MINIMAX_HOME"),
+                System.getenv("MINIMAX_DATA_DIR"),
+                NodeDetector.resolveHomeForFileOps());
+    }
+
+    /**
+     * Pure home resolution for tests. Order mirrors where the mcode CLI looks:
+     * plugin overrides first, then MINIMAX_DATA_DIR — the variable the
+     * official Windows install shims export, which relocates the whole data
+     * dir (config + v2/sessions) away from ~/.minimax — and the default last.
+     * Ignoring it made every shim-launched session invisible to history.
+     */
+    static Path resolveMinimaxHome(String codeHome, String home, String dataDir, String defaultUserHome) {
+        String override = firstNonBlank(codeHome, home, dataDir);
         if (override != null) {
             return Paths.get(override.trim());
         }
-        return Paths.get(home, ".minimax");
+        return Paths.get(defaultUserHome, ".minimax");
     }
 
     public static class SessionInfo {
